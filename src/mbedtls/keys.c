@@ -19,9 +19,7 @@
 #include "../um_debug.h"
 #include "../alloc.h"
 #include "keys.h"
-#include "mbedtls/ctr_drbg.h"
-#include "mbedtls/entropy.h"
-#include "mbedtls/version.h"
+#include "psa/crypto.h"
 #include "p11.h"
 #include "mbed_p11.h"
 
@@ -153,18 +151,8 @@ static int privkey_sign(tlsuv_private_key_t pk, enum hash_algo md, const char *d
     }
     int size = mbedtls_md_get_size(md_info);
 
-    mbedtls_ctr_drbg_context ctr_drbg;
-    mbedtls_ctr_drbg_init(&ctr_drbg);
-
-    mbedtls_entropy_context entropy;
-    mbedtls_entropy_init(&entropy);
-    mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, NULL, 0);
-
-#if MBEDTLS_VERSION_MAJOR == 3
-    if (mbedtls_pk_sign(&priv->pkey, type, hash, size, (uint8_t *)sig, *siglen, siglen, mbedtls_ctr_drbg_random, &ctr_drbg) != 0) {
-#else
-    if (mbedtls_pk_sign(&priv->pkey, type, hash, size, (uint8_t *)sig, siglen, mbedtls_ctr_drbg_random, &ctr_drbg) != 0) {
-#endif
+    psa_crypto_init();
+    if (mbedtls_pk_sign(&priv->pkey, type, hash, size, (uint8_t *)sig, *siglen, siglen) != 0) {
         return -1;
     }
     return 0;
@@ -204,32 +192,18 @@ int load_key(tlsuv_private_key_t *key, const char* keydata, size_t keydatalen) {
     priv_key_init(privkey);
     mbedtls_pk_init(&privkey->pkey);
 
-    mbedtls_ctr_drbg_context ctr_drbg;
-    mbedtls_ctr_drbg_init(&ctr_drbg);
-
-    mbedtls_entropy_context entropy;
-    mbedtls_entropy_init(&entropy);
-
-    // todo move this into engine init?
-    int rc = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, NULL, 0);
+    int rc = (int) psa_crypto_init();
     if (rc != 0) {
+        UM_LOG(ERR, "psa_crypto_init failed: %d", rc);
         mbedtls_pk_free(&privkey->pkey);
         tlsuv__free(privkey);
         *key = NULL;
         return rc;
     }
     size_t keylen = keydata[keydatalen - 1] == 0 ? keydatalen : keydatalen + 1;
-    rc = mbedtls_pk_parse_key(&privkey->pkey, (const unsigned char *) keydata, keylen, NULL, 0
-#if MBEDTLS_VERSION_MAJOR == 3
-            ,mbedtls_ctr_drbg_random, &ctr_drbg
-#endif
-    );
+    rc = mbedtls_pk_parse_key(&privkey->pkey, (const unsigned char *) keydata, keylen, NULL, 0);
     if (rc < 0) {
-        rc = mbedtls_pk_parse_keyfile(&privkey->pkey, keydata, NULL
-#if MBEDTLS_VERSION_MAJOR == 3
-            ,mbedtls_ctr_drbg_random, &ctr_drbg
-#endif
-        );
+        rc = mbedtls_pk_parse_keyfile(&privkey->pkey, keydata, NULL);
         if (rc < 0) {
             mbedtls_pk_free(&privkey->pkey);
             tlsuv__free(privkey);
@@ -244,34 +218,40 @@ int load_key(tlsuv_private_key_t *key, const char* keydata, size_t keydatalen) {
 
 int gen_key(tlsuv_private_key_t *key) {
     int ret;
-    mbedtls_entropy_context entropy;
-    mbedtls_ctr_drbg_context ctr_drbg;
-    const char *pers = "gen_key";
-    mbedtls_ecp_group_id ec_curve = MBEDTLS_ECP_DP_SECP256R1;
-    mbedtls_pk_type_t pk_type = MBEDTLS_PK_ECKEY;
 
     struct priv_key_s *private_key = tlsuv__calloc(1, sizeof(struct priv_key_s));
     *private_key = PRIV_KEY_API;
     mbedtls_pk_context *pk = &private_key->pkey;
     mbedtls_pk_init(pk);
-    mbedtls_ctr_drbg_init(&ctr_drbg);
 
-    mbedtls_entropy_init(&entropy);
-
-    if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *) pers,
-                                     strlen(pers))) != 0) {
-        UM_LOG(ERR, "mbedtls_ctr_drbg_seed returned -0x%04x: %s", -ret, mbedtls_error(ret));
+    // raw ECP key generation (mbedtls_ecp_gen_key et al.) is private/internal
+    // as of mbedtls 4.x -- keys are generated via PSA and copied into a
+    // standalone (non-opaque) legacy pk context so the rest of this file
+    // (sign/pubkey/to_pem) keeps working unmodified.
+    psa_status_t status = psa_crypto_init();
+    if (status != PSA_SUCCESS) {
+        UM_LOG(ERR, "psa_crypto_init failed: %d", (int)status);
+        ret = (int)status;
         goto on_error;
     }
 
-    // Generate the key
-    if ((ret = mbedtls_pk_setup(pk, mbedtls_pk_info_from_type(pk_type))) != 0) {
-        UM_LOG(ERR, "mbedtls_pk_setup returned -0x%04x: %s", -ret, mbedtls_error(ret));
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_EXPORT);
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
+    psa_set_key_bits(&attributes, 256);
+
+    mbedtls_svc_key_id_t psa_key_id;
+    status = psa_generate_key(&attributes, &psa_key_id);
+    if (status != PSA_SUCCESS) {
+        UM_LOG(ERR, "psa_generate_key failed: %d", (int)status);
+        ret = (int)status;
         goto on_error;
     }
 
-    if ((ret = mbedtls_ecp_gen_key(ec_curve, mbedtls_pk_ec(*pk), mbedtls_ctr_drbg_random, &ctr_drbg)) != 0) {
-        UM_LOG(ERR, "mbedtls_ecp_gen_key returned -0x%04x: %s", -ret, mbedtls_error(ret));
+    ret = mbedtls_pk_copy_from_psa(psa_key_id, pk);
+    psa_destroy_key(psa_key_id);
+    if (ret != 0) {
+        UM_LOG(ERR, "mbedtls_pk_copy_from_psa returned -0x%04x: %s", -ret, mbedtls_error(ret));
         goto on_error;
     }
 

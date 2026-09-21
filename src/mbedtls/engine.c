@@ -18,19 +18,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <mbedtls/version.h>
 #include <mbedtls/x509_csr.h>
 #include <mbedtls/ssl.h>
 #include <mbedtls/debug.h>
-#include <mbedtls/ctr_drbg.h>
-#include <mbedtls/entropy.h>
+#include <psa/crypto.h>
 #include <mbedtls/error.h>
 #include <mbedtls/base64.h>
 #include <mbedtls/net_sockets.h>
 #include <mbedtls/asn1.h>
-#include <mbedtls/asn1write.h>
+#include <mbedtls/psa_util.h>
 #include <mbedtls/oid.h>
 #include <mbedtls/pem.h>
-#include <mbedtls/version.h>
 
 #include "../alloc.h"
 #include "../um_debug.h"
@@ -101,8 +100,6 @@ struct mbedtls_engine {
     struct in6_addr addr;
     int (*cert_verify_f)(const struct tlsuv_certificate_s * cert, void *v_ctx);
     void *verify_ctx;
-    mbedtls_ctr_drbg_context *drbg;
-    mbedtls_entropy_context *entropy;
 };
 
 static void mbedtls_set_alpn_protocols(tlsuv_engine_t engine, const char** protos, int len);
@@ -263,13 +260,9 @@ static void init_ssl_context(mbedtls_ssl_config *ssl_config, const char *cabuf, 
     mbedtls_ssl_conf_renegotiation(ssl_config, MBEDTLS_SSL_RENEGOTIATION_ENABLED);
 #endif
     mbedtls_ssl_conf_authmode(ssl_config, MBEDTLS_SSL_VERIFY_REQUIRED);
-    engine->drbg = tlsuv__calloc(1, sizeof(mbedtls_ctr_drbg_context));
-    engine->entropy = tlsuv__calloc(1, sizeof(mbedtls_entropy_context));
-    mbedtls_ctr_drbg_init(engine->drbg);
-    mbedtls_entropy_init(engine->entropy);
-    unsigned char *seed = tlsuv__malloc(MBEDTLS_ENTROPY_MAX_SEED_SIZE); // uninitialized memory
-    mbedtls_ctr_drbg_seed(engine->drbg, mbedtls_entropy_func, engine->entropy, seed, MBEDTLS_ENTROPY_MAX_SEED_SIZE);
-    mbedtls_ssl_conf_rng(ssl_config, mbedtls_ctr_drbg_random, engine->drbg);
+    // mbedtls 4.x has no mbedtls_ssl_conf_rng() -- TLS internals draw randomness
+    // from the PSA subsystem once it's initialized.
+    psa_crypto_init();
 
     engine->ca = tlsuv__calloc(1, sizeof(mbedtls_x509_crt));
     mbedtls_x509_crt_init(engine->ca);
@@ -318,7 +311,6 @@ static void init_ssl_context(mbedtls_ssl_config *ssl_config, const char *cabuf, 
 
 
     mbedtls_ssl_conf_ca_chain(ssl_config, engine->ca, NULL);
-    tlsuv__free(seed);
 }
 
 static int internal_cert_verify(void *ctx, mbedtls_x509_crt *crt, int depth, uint32_t *flags) {
@@ -444,31 +436,16 @@ static void mbedtls_set_cert_verify(tls_context *ctx,
     c->verify_ctx = v_ctx;
 }
 
-static size_t mbedtls_sig_to_asn1(const char *sig, size_t siglen, unsigned char *asn1sig) {
-    mbedtls_mpi r, s;
-    mbedtls_mpi_init(&r);
-    mbedtls_mpi_init(&s);
-
-    CK_ULONG coordlen = siglen / 2;
-    mbedtls_mpi_read_binary(&r, (const uint8_t *)sig, coordlen);
-    mbedtls_mpi_read_binary(&s, (const uint8_t *)sig + coordlen, coordlen);
-
-    int ret;
-    unsigned char buf[MBEDTLS_ECDSA_MAX_LEN];
-    unsigned char *p = buf + sizeof(buf);
-    size_t len = 0;
-
-    MBEDTLS_ASN1_CHK_ADD(len, mbedtls_asn1_write_mpi(&p, buf, &s));
-    MBEDTLS_ASN1_CHK_ADD(len, mbedtls_asn1_write_mpi(&p, buf, &r));
-
-    MBEDTLS_ASN1_CHK_ADD(len, mbedtls_asn1_write_len(&p, buf, len));
-    MBEDTLS_ASN1_CHK_ADD(len, mbedtls_asn1_write_tag(&p, buf,
-                                                     MBEDTLS_ASN1_CONSTRUCTED | MBEDTLS_ASN1_SEQUENCE));
-
-    memcpy(asn1sig, p, len);
-    mbedtls_mpi_free(&r);
-    mbedtls_mpi_free(&s);
-    return len;
+// raw ECDSA signatures (r||s) are converted to ASN.1/DER via the PSA util
+// helper -- mbedtls_mpi/mbedtls_asn1_write_* are private/internal as of mbedtls 4.x.
+static size_t mbedtls_sig_to_asn1(const char *sig, size_t siglen, unsigned char *asn1sig, size_t asn1sig_size) {
+    size_t coordlen = siglen / 2;
+    size_t der_len = 0;
+    if (mbedtls_ecdsa_raw_to_der(coordlen * 8, (const unsigned char *)sig, siglen,
+                                 asn1sig, asn1sig_size, &der_len) != 0) {
+        return 0;
+    }
+    return der_len;
 }
 
 static int mbedtls_verify_signature(const struct tlsuv_certificate_s *c, enum hash_algo md, const char* data, size_t datalen, const char* sig, size_t siglen) {
@@ -499,15 +476,11 @@ static int mbedtls_verify_signature(const struct tlsuv_certificate_s *c, enum ha
         return -1;
     }
 
-    if (mbedtls_pk_get_type(&crt->pk) == MBEDTLS_PK_ECKEY) {
-
-    }
-
     int rc = mbedtls_pk_verify(&crt->pk, type, hash, 0, (uint8_t *) sig, siglen);
     if (rc != 0) {
-        if (mbedtls_pk_get_type(&crt->pk) == MBEDTLS_PK_ECKEY) {
-            unsigned char asn1sig[MBEDTLS_ECDSA_MAX_LEN];
-            size_t asn1len = mbedtls_sig_to_asn1(sig, siglen, asn1sig);
+        if (PSA_KEY_TYPE_IS_ECC(mbedtls_pk_get_key_type(&crt->pk))) {
+            unsigned char asn1sig[MBEDTLS_ECDSA_DER_MAX_LEN];
+            size_t asn1len = mbedtls_sig_to_asn1(sig, siglen, asn1sig, sizeof(asn1sig));
 
             rc = mbedtls_pk_verify(&crt->pk, type, hash, 0, asn1sig, asn1len);
         }
@@ -560,10 +533,6 @@ static void mbedtls_free(tlsuv_engine_t engine) {
     }
     mbedtls_x509_crt_free(e->ca);
     mbedtls_ssl_config_free(&e->config);
-    mbedtls_ctr_drbg_free(e->drbg);
-    mbedtls_entropy_free(e->entropy);
-    tlsuv__free(e->drbg);
-    tlsuv__free(e->entropy);
     tlsuv__free(e->ca);
     tlsuv__free(e);
 }
@@ -630,25 +599,12 @@ static int mbedtls_set_own_cert(tls_context *ctx, tlsuv_private_key_t key, tlsuv
     struct priv_key_s *pk = (struct priv_key_s *)key;
     struct cert_s *crt = (struct cert_s *) cert;
 
-#if MBEDTLS_VERSION_MAJOR == 3
-    mbedtls_ctr_drbg_context ctr_drbg;
-    mbedtls_ctr_drbg_init(&ctr_drbg);
-
-    mbedtls_entropy_context entropy;
-    mbedtls_entropy_init(&entropy);
-    mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, NULL, 0);
-#endif
-
     // Find the certificate matching the private key — the chain may
     // not have the leaf first (e.g. PEM with intermediate before leaf).
     mbedtls_x509_crt *leaf = NULL;
     mbedtls_x509_crt *prev = NULL;
     for (mbedtls_x509_crt *cur = crt->chain; cur != NULL; cur = cur->next) {
-#if MBEDTLS_VERSION_MAJOR == 3
-        if (mbedtls_pk_check_pair(&cur->pk, &pk->pkey, mbedtls_ctr_drbg_random, &ctr_drbg) == 0) {
-#else
         if (mbedtls_pk_check_pair(&cur->pk, &pk->pkey) == 0) {
-#endif
             leaf = cur;
             break;
         }
@@ -668,11 +624,6 @@ static int mbedtls_set_own_cert(tls_context *ctx, tlsuv_private_key_t key, tlsuv
         UM_LOG(ERR, "no certificate matching the private key was found");
         rc = -1;
     }
-
-#if MBEDTLS_VERSION_MAJOR == 3
-    mbedtls_entropy_free(&entropy);
-    mbedtls_ctr_drbg_free(&ctr_drbg);
-#endif
 
     return rc;
 }
@@ -1016,15 +967,12 @@ static int generate_csr(tlsuv_private_key_t key, char **pem, size_t *pemlen, ...
 
     int ret;
     mbedtls_pk_context *pk = &k->pkey;
-    mbedtls_ctr_drbg_context ctr_drbg;
     char buf[1024];
-    mbedtls_entropy_context entropy;
-    const char *pers = "gen_csr";
 
     mbedtls_x509write_csr csr;
     // Set to sane values
     mbedtls_x509write_csr_init(&csr);
-    mbedtls_ctr_drbg_init(&ctr_drbg);
+    psa_crypto_init();
     memset(buf, 0, sizeof(buf));
 
     char subject_name[MBEDTLS_X509_MAX_DN_NAME_SIZE];
@@ -1057,12 +1005,6 @@ static int generate_csr(tlsuv_private_key_t key, char **pem, size_t *pemlen, ...
     mbedtls_x509write_csr_set_md_alg(&csr, MBEDTLS_MD_SHA256);
     mbedtls_x509write_csr_set_key_usage(&csr, 0);
     mbedtls_x509write_csr_set_ns_cert_type(&csr, MBEDTLS_X509_NS_CERT_TYPE_SSL_CLIENT);
-    mbedtls_entropy_init(&entropy);
-    if ((ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, (const unsigned char *) pers,
-                                     strlen(pers))) != 0) {
-        UM_LOG(ERR, "mbedtls_ctr_drbg_seed returned %d: %s", ret, mbedtls_error(ret));
-        goto on_error;
-    }
 
     if ((ret = mbedtls_x509write_csr_set_subject_name(&csr, subject_name)) != 0) {
         UM_LOG(ERR, "mbedtls_x509write_csr_set_subject_name returned %d", ret);
@@ -1071,7 +1013,7 @@ static int generate_csr(tlsuv_private_key_t key, char **pem, size_t *pemlen, ...
 
     mbedtls_x509write_csr_set_key(&csr, pk);
     uint8_t pembuf[4096];
-    if ((ret = mbedtls_x509write_csr_pem(&csr, pembuf, sizeof(pembuf), mbedtls_ctr_drbg_random, &ctr_drbg)) < 0) {
+    if ((ret = mbedtls_x509write_csr_pem(&csr, pembuf, sizeof(pembuf))) < 0) {
         UM_LOG(ERR, "mbedtls_x509write_csr_pem returned %d/%s", ret, mbedtls_error(ret));
         goto on_error;
     }
