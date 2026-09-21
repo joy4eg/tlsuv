@@ -22,9 +22,9 @@ target_include_directories(mbedtls-impl
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
 if (MBEDTLS_INCLUDE_DIRS)
-    target_include_directories(mbedtls-impl PRIVATE $<BUILD_INTERFACE:${MBEDTLS_INCLUDE_DIRS}>)
+    target_include_directories(mbedtls-impl PUBLIC $<BUILD_INTERFACE:${MBEDTLS_INCLUDE_DIRS}>)
 endif ()
-target_link_libraries(mbedtls-impl PRIVATE ${TLSUV_MBEDTLS_LIBS})
+target_link_libraries(mbedtls-impl PUBLIC ${TLSUV_MBEDTLS_LIBS})
 if (WIN32)
     target_link_libraries(mbedtls-impl PUBLIC bcrypt)
 endif ()
